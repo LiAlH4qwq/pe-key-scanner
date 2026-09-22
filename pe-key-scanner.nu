@@ -1,30 +1,15 @@
 #!/usr/bin/env nu
 
-# pe-key-scanner -- scan every block-device partition, mount what is not yet
-# mounted (read-only), and look for an SSH private key at a configured path
-# (default `LIUXUTOOLS/ssh.key`). PECMD-style: find the key on whatever disk it
-# lives on. Behaviour is driven entirely by a JSON config file.
+# pe-key-scanner -- scan every block-device partition and bare disk, mount what
+# is not yet mounted (always read-only), and look for an SSH private key at a
+# configured path (default `LIUXUTOOLS/ssh.key`). PECMD-style: find the key on
+# whatever disk it lives on. Behaviour is driven entirely by a JSON config file.
 #
 # Requires root: mounting arbitrary filesystems needs CAP_SYS_ADMIN.
 
-const DEFAULT_FILESYSTEMS = [
-    "vfat"
-    "exfat"
-    "ntfs"
-    "ntfs3"
-    "ext4"
-    "ext3"
-    "ext2"
-    "btrfs"
-    "xfs"
-    "f2fs"
-    "hfsplus"
-    "iso9660"
-]
-
 const DEFAULT_SEARCH_PATH = "LIUXUTOOLS/ssh.key"
 
-const DEFAULT_TEMP_MOUNTS = ["/run/pe-key-scanner/mnt"]
+const DEFAULT_TEMP_MOUNT_DIR = "/run/pe-key-scanner/mnt"
 
 const DEFAULT_OUTPUT = "/run/pe-key-scanner/ssh.key"
 
@@ -48,30 +33,32 @@ def "load-config" [path: path] {
         error make { msg: $"config file not found: ($path)" }
     }
     let raw = (open --raw $path | from json)
+    let kind = ($raw | describe)
+    if not ($kind | str starts-with "record") {
+        error make { msg: $"config must be a JSON object, got ($kind)" }
+    }
     let output = ($raw | get -o output | default $DEFAULT_OUTPUT)
-    if ($output | path type) == "dir" {
+    let output_kind = (try { $output | path type } catch { null })
+    if $output_kind == "dir" {
         error make { msg: $"config `output` must be a file path, got a directory: ($output)" }
     }
-    let temp_mounts = ($raw | get -o temp_mounts | default $DEFAULT_TEMP_MOUNTS)
-    if ($temp_mounts | is-empty) {
-        error make { msg: "config `temp_mounts` must contain at least one directory" }
+    let temp_mount_dir = ($raw | get -o temp_mount_dir | default $DEFAULT_TEMP_MOUNT_DIR)
+    if ((try { $temp_mount_dir | path type } catch { null }) == "file") {
+        error make { msg: $"config `temp_mount_dir` must be a directory, got a file: ($temp_mount_dir)" }
     }
     {
-        temp_mounts: $temp_mounts
+        temp_mount_dir: $temp_mount_dir
         search_path: ($raw | get -o search_path | default $DEFAULT_SEARCH_PATH)
         output: $output
-        filesystems: ($raw | get -o filesystems | default $DEFAULT_FILESYSTEMS)
-        read_only: ($raw | get -o read_only | default true)
-        scan_mounted: ($raw | get -o scan_mounted | default true)
         stop_on_first: ($raw | get -o stop_on_first | default true)
-        cleanup: ($raw | get -o cleanup | default true)
         case_insensitive: ($raw | get -o case_insensitive | default true)
         mount_options: ($raw | get -o mount_options | default {})
     }
 }
 
-# All candidate partitions (type=part), filtered by filesystem and de-duplicated
-# by UUID so btrfs multi-subvolume mounts are not scanned repeatedly.
+# All candidate block devices: partitions and bare disks. De-duplicated by
+# device name. Swap and encrypted (crypto_*) devices are skipped, since they
+# cannot be mounted without first being activated.
 def "get-partitions" [cfg: record] {
     let all = (
         try {
@@ -84,46 +71,117 @@ def "get-partitions" [cfg: record] {
         }
     )
     $all
-    | where {|d| ($d.type == "part") and ($d.fstype != null) and ($d.fstype in $cfg.filesystems) and (not ($d.fstype | str starts-with "crypto_")) }
-    | uniq-by uuid
+    | where {|d| (($d.type == "part") or ($d.type == "disk")) and ($d.fstype? | default "") != "swap" and (not (($d.fstype? | default "") | str starts-with "crypto_")) }
+    | uniq-by name
 }
 
-# Map a detected fstype to the `mount -t` argument (ntfs needs the ntfs-3g helper).
-def "mount-fs" [fstype: string] {
-    if $fstype == "ntfs" { "ntfs-3g" } else { $fstype }
+# Map a detected fstype to the `mount -t` argument (ntfs needs the ntfs-3g
+# helper). An empty result means "let mount autodetect".
+def "mount-fs" [fstype: any] {
+    if ($fstype | is-empty) { "" } else if $fstype == "ntfs" { "ntfs-3g" } else { $fstype }
 }
 
-# Compose the `-o` option string for a filesystem.
-def "mount-opt" [cfg: record, fstype: string] {
-    let base = (if $cfg.read_only { "ro" } else { "rw" })
-    let extra = ($cfg.mount_options | get -o $fstype | default "")
-    if ($extra | is-empty) { $base } else { $"($base),($extra)" }
+# Try to mount `dev` at `dir`, read-only. Uses the detected fstype when known and
+# falls back to autodetection before giving up, so it does its best to mount
+# whatever it can. Returns a `complete`-style record.
+def "attempt-mount" [dev: string, dir: string, fstype: any, opt: string] {
+    let fs = (mount-fs $fstype)
+    let first = (
+        if ($fs | is-empty) {
+            ^mount -o $opt $dev $dir | complete
+        } else {
+            ^mount -t $fs -o $opt $dev $dir | complete
+        }
+    )
+    if $first.exit_code == 0 or ($fs | is-empty) {
+        return $first
+    }
+    ^mount -o $opt $dev $dir | complete
 }
 
-# Resolve a relative path under `root`, optionally case-insensitively, without
-# ever following a symlink out of the tree. Returns the absolute file path or null.
+# Compose the `-o` option string for a filesystem (always read-only).
+def "mount-opt" [cfg: record, fstype: any] {
+    let extra = (
+        if ($fstype | is-empty) { "" } else { $cfg.mount_options | get -o $fstype | default "" }
+    )
+    if ($extra | is-empty) { "ro" } else { $"ro,($extra)" }
+}
+
+# Resolve a relative path under `root`, optionally case-insensitively. Every
+# intermediate component must be a real directory and the leaf a real file, so
+# symlinked components cannot redirect the lookup out of the scanned tree.
 def "resolve-key" [root: string, rel: string, ci: bool] {
-    if not ($root | path exists) { return null }
+    let root_ok = (try { $root | path exists } catch { false })
+    if not $root_ok { return null }
+    let parts = ($rel | path split)
+    if ($parts | is-empty) { return null }
+    let last_idx = (($parts | length) - 1)
     mut cur = $root
-    for part in ($rel | path split) {
+    for part in ($parts | enumerate) {
         let entries = (try { ls -a $cur } catch { [] })
         let hit = (
             $entries
             | where {|e|
                 let b = ($e.name | path basename)
-                if $ci { $b =~ ("(?i)^" + ($part | str escape-regex) + "$") } else { $b == $part }
+                if $ci { $b =~ ("(?i)^" + ($part.item | str escape-regex) + "$") } else { $b == $part.item }
             }
             | get -o name
             | first
         )
         if $hit == null { return null }
+        let kind = (try { $hit | path type } catch { null })
+        if $part.index == $last_idx {
+            return (if $kind == "file" { $hit } else { null })
+        }
+        if $kind != "dir" { return null }
         $cur = $hit
     }
-    if (($cur | path type) == "file") { $cur } else { null }
+    null
 }
 
 def "mountpoints-of" [d: record] {
     $d.mountpoints? | default [] | where {|m| $m != null and $m != "[SWAP]" }
+}
+
+# Persist a found key to `out`. Must be called while the source is still
+# readable, i.e. before a temporary mount is torn down. Fails loudly if the key
+# cannot be copied or its permissions set, so a scan never reports success
+# without the key actually being stored.
+def "store-key" [src: string, out: string] {
+    if ($src | path expand) != ($out | path expand) {
+        let r = (^cp -f $src $out | complete)
+        if $r.exit_code != 0 {
+            error make { msg: $"failed to copy key to ($out): ($r.stderr | str trim)" }
+        }
+    }
+    let c = (^chmod 600 $out | complete)
+    if $c.exit_code != 0 {
+        error make { msg: $"failed to chmod 600 ($out): ($c.stderr | str trim)" }
+    }
+}
+
+# Best-effort teardown of one temporary mount point: unmount, then remove the
+# now-empty directory. This is deliberately *not* recursive, so a failed
+# unmount can never delete the mounted volume's contents. Any problem is only
+# a warning and never changes the exit code.
+def "cleanup-mount" [dir: string] {
+    let u = (^umount $dir | complete)
+    if $u.exit_code != 0 {
+        print -e $"warning: umount ($dir) failed, leaving it alone: ($u.stderr | str trim)"
+        return
+    }
+    let r = (^rmdir $dir | complete)
+    if $r.exit_code != 0 {
+        print -e $"warning: could not remove temp mount point ($dir): ($r.stderr | str trim)"
+    }
+}
+
+# Best-effort removal of the now-empty temp mount pool (rmdir only, never -r).
+def "cleanup-pool" [pool: string] {
+    let r = (^rmdir $pool | complete)
+    if $r.exit_code != 0 {
+        print -e $"warning: could not remove temp mount pool ($pool): ($r.stderr | str trim)"
+    }
 }
 
 def main [
@@ -148,14 +206,16 @@ def main [
                     fstype: $d.fstype
                     label: ($d.label | default "")
                     size: $d.size
-                    action: (if ($mps | is-not-empty) and $cfg.scan_mounted {
+                    action: (if ($mps | is-not-empty) {
                         "scan (already mounted)"
-                    } else if ($mps | is-not-empty) {
-                        "skip (mounted, scan_mounted=false)"
                     } else {
                         "mount + scan"
                     })
-                    mountpoints: ($mps | str join ", ")
+                    mountpoints: (if ($mps | is-not-empty) {
+                        $mps | str join ", "
+                    } else {
+                        $cfg.temp_mount_dir | path join $d.name
+                    })
                 }
             }
             | table -e
@@ -171,7 +231,8 @@ def main [
 
     mut results = []
     mut found = ""
-    mut temp_idx = 0
+    mut pool_created = false
+    let pool = $cfg.temp_mount_dir
 
     for d in $partitions {
         if ($found | is-not-empty) and $cfg.stop_on_first { break }
@@ -181,10 +242,6 @@ def main [
         let label = ($d.label | default "")
 
         if ($mps | is-not-empty) {
-            if not $cfg.scan_mounted {
-                if $verbose { print -e $"skip ($dev): mounted and scan_mounted=false" }
-                continue
-            }
             for mp in $mps {
                 let key = (resolve-key $mp $cfg.search_path $cfg.case_insensitive)
                 if $verbose { print -e $"scan ($dev) at ($mp): (if $key == null { 'no key' } else { $key })" }
@@ -197,24 +254,48 @@ def main [
                     status: (if $key == null { "not-found" } else { "FOUND" })
                     key: $key
                 })
-                if $key != null { $found = $key }
+                if $key != null and ($found | is-empty) {
+                    store-key $key $cfg.output
+                    $found = $key
+                }
             }
         } else {
-            let dir = ($cfg.temp_mounts | get ($temp_idx mod ($cfg.temp_mounts | length)))
-            $temp_idx = ($temp_idx + 1)
-            ^mkdir -p $dir
+            if not $pool_created {
+                let mk = (^mkdir -p $pool | complete)
+                if $mk.exit_code == 0 {
+                    ^chmod 700 $pool | complete | ignore
+                    $pool_created = true
+                } else {
+                    print -e $"warning: cannot create temp mount pool ($pool): ($mk.stderr | str trim)"
+                }
+            }
 
-            let fs = (mount-fs $d.fstype)
+            # Each device gets its own mount point inside the pool; the pool
+            # itself is never used as a mount point and is only ever rmdir'd.
+            let dir = ($pool | path join $d.name)
+            let mkdir_res = (^mkdir -p $dir | complete)
             let opt = (mount-opt $cfg $d.fstype)
-            let res = (^mount -t $fs -o $opt $dev $dir | complete)
+            let res = (
+                if $mkdir_res.exit_code == 0 {
+                    attempt-mount $dev $dir $d.fstype $opt
+                } else {
+                    {
+                        exit_code: 1
+                        stdout: ""
+                        stderr: $"cannot create mount point ($dir): ($mkdir_res.stderr | str trim)"
+                    }
+                }
+            )
 
             if $res.exit_code == 0 {
                 let key = (resolve-key $dir $cfg.search_path $cfg.case_insensitive)
                 if $verbose { print -e $"mount ($dev) -> ($dir): (if $key == null { 'no key' } else { $key })" }
-                if $cfg.cleanup {
-                    ^umount $dir | complete | ignore
-                    ^rmdir $dir | complete | ignore
+                # Copy while still mounted: the mount point is torn down below.
+                if $key != null and ($found | is-empty) {
+                    store-key $key $cfg.output
+                    $found = $key
                 }
+                cleanup-mount $dir
                 $results = ($results | append {
                     device: $dev
                     fstype: $d.fstype
@@ -224,7 +305,6 @@ def main [
                     status: (if $key == null { "not-found" } else { "FOUND" })
                     key: $key
                 })
-                if $key != null { $found = $key }
             } else {
                 let err = ($res.stderr | str trim | str replace -a "\n" " ")
                 if $verbose { print -e $"mount ($dev) failed: ($err)" }
@@ -241,9 +321,11 @@ def main [
         }
     }
 
+    if $pool_created {
+        cleanup-pool $pool
+    }
+
     if ($found | is-not-empty) {
-        ^cp -f $found $cfg.output
-        ^chmod 600 $cfg.output
         print $"FOUND ($found)"
         print $"stored key -> ($cfg.output)"
         if ($results | where status == "FOUND" | length) > 1 {

@@ -28,16 +28,10 @@ let
         cp ${settingsFile} $out
       '';
 
-  devtype =
-    {
-      partition = ''ENV{DEVTYPE}=="partition", '';
-      disk = ''ENV{DEVTYPE}=="disk", '';
-      any = "";
-    }
-    .${cfg.service.deviceAddMatch};
-
+  # Trigger on any block-device add. Bare disks as well as partitions are
+  # scanned, and every run is a full rescan, so no DEVTYPE filter is applied.
   udevRule = ''
-    SUBSYSTEM=="block", ACTION=="add", ${devtype}ENV{ID_FS_TYPE}!="", TAG+="systemd", ENV{SYSTEMD_WANTS}+="pe-key-scanner.service"
+    SUBSYSTEM=="block", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="pe-key-scanner.service"
   '';
 in
 {
@@ -59,7 +53,7 @@ in
         the scanner. Validated against the packaged
         {file}`pe-key-scanner.schema.json` at build time.
 
-        Every key has a default (`temp_mounts`, `search_path`, `output`), so an
+        Every key has a default (`temp_mount_dir`, `search_path`, `output`), so an
         empty set is valid; only `enable = true` is needed. Set keys here to
         override the defaults.
       '';
@@ -88,21 +82,11 @@ in
         type = lib.types.bool;
         default = true;
         description = ''
-          Re-run the scanner whenever a matching block device is added (e.g. a
-          USB disk is plugged in). Implemented with a udev rule that pulls the
-          unit in via `SYSTEMD_WANTS=`; every run is a full rescan of all
-          partitions, so newly available keys are discovered.
+          Re-run the scanner whenever any block device is added (e.g. a USB
+          disk is plugged in). Implemented with a udev rule that pulls the unit
+          in via `SYSTEMD_WANTS=`; every run is a full rescan of all partitions
+          and bare disks, so newly available keys are discovered.
         '';
-      };
-
-      deviceAddMatch = lib.mkOption {
-        type = lib.types.enum [
-          "partition"
-          "disk"
-          "any"
-        ];
-        default = "partition";
-        description = "Which udev block devices retrigger the scanner.";
       };
 
       onSuccess = lib.mkOption {
@@ -111,8 +95,24 @@ in
         description = ''
           Units activated via `OnSuccess=` after the scanner completes
           successfully (i.e. a key was found). Use this to re-trigger consumers.
+
+          Note: this only *starts* a unit, so it is a no-op for `oneshot` units
+          with `RemainAfterExit = true` (e.g. `sops-install-secrets.service`)
+          that are already active — use {option}`restartOnSuccess` for those.
         '';
         example = [ "sshd.service" ];
+      };
+
+      restartOnSuccess = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          Units force-restarted (`systemctl --no-block restart`) after the
+          scanner completes successfully. Unlike {option}`onSuccess`, this also
+          re-runs `oneshot` units that stay active via `RemainAfterExit`, such as
+          `sops-install-secrets.service`.
+        '';
+        example = [ "sops-install-secrets.service" ];
       };
 
       after = lib.mkOption {
@@ -167,6 +167,13 @@ in
 
         # Safety net for mounts left behind by an interrupted scan.
         ExecStopPost = [ "-${pkgs.util-linux}/bin/umount -R /run/pe-key-scanner" ];
+      }
+      // lib.optionalAttrs (cfg.service.restartOnSuccess != [ ]) {
+        # Runs only when ExecStart succeeds (a key was found). `--no-block`
+        # avoids an ordering deadlock while this unit is still activating.
+        ExecStartPost = map (
+          u: "-${config.systemd.package}/bin/systemctl --no-block restart ${u}"
+        ) cfg.service.restartOnSuccess;
       }
       // cfg.service.extraConfig;
     };

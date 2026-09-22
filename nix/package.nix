@@ -48,6 +48,7 @@ symlinkJoin {
 
   meta = {
     description = "PECMD-style partition scanner that mounts filesystems and locates LIUXUTOOLS/ssh.key";
+    homepage = "https://github.com/lialh4qwq/pe-key-scanner";
     mainProgram = "pe-key-scanner";
     platforms = lib.platforms.linux;
   };
