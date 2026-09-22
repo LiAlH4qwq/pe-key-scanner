@@ -1,0 +1,27 @@
+{
+  "temp_mounts": [
+    "/run/pe-key-scanner/mnt"
+  ],
+  "search_path": "LIUXUTOOLS/ssh.key",
+  "output": "/run/pe-key-scanner/ssh.key",
+  "filesystems": [
+    "vfat",
+    "exfat",
+    "ntfs",
+    "ntfs3",
+    "ext4",
+    "ext3",
+    "ext2",
+    "btrfs",
+    "xfs",
+    "f2fs",
+    "hfsplus",
+    "iso9660"
+  ],
+  "read_only": true,
+  "scan_mounted": true,
+  "stop_on_first": true,
+  "cleanup": true,
+  "case_insensitive": true,
+  "mount_options": {}
+}

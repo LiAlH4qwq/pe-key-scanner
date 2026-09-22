@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/lialh4/pe-key-scanner/pe-key-scanner.schema.json",
+  "title": "pe-key-scanner configuration",
+  "description": "Controls how pe-key-scanner enumerates partitions, mounts them and where the discovered SSH private key is stored.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "temp_mounts": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1,
+      "uniqueItems": true,
+      "default": ["/run/pe-key-scanner/mnt"],
+      "description": "Directories used as temporary mount points for unmounted filesystems. Reused round-robin."
+    },
+    "search_path": {
+      "type": "string",
+      "minLength": 1,
+      "default": "LIUXUTOOLS/ssh.key",
+      "description": "Path looked up relative to the root of every scanned filesystem."
+    },
+    "output": {
+      "type": "string",
+      "minLength": 1,
+      "default": "/run/pe-key-scanner/ssh.key",
+      "description": "Destination file for the first key found. Parent directory is created with mode 700 and the key is written with mode 600."
+    },
+    "filesystems": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1,
+      "uniqueItems": true,
+      "default": ["vfat", "exfat", "ntfs", "ntfs3", "ext4", "ext3", "ext2", "btrfs", "xfs", "f2fs", "hfsplus", "iso9660"],
+      "description": "Allowed lsblk filesystem types. Encrypted (crypto_*) and swap devices are always skipped."
+    },
+    "read_only": {
+      "type": "boolean",
+      "default": true,
+      "description": "Mount temporarily scanned filesystems read-only."
+    },
+    "scan_mounted": {
+      "type": "boolean",
+      "default": true,
+      "description": "Also scan filesystems that are already mounted, in place (left untouched)."
+    },
+    "stop_on_first": {
+      "type": "boolean",
+      "default": true,
+      "description": "Stop as soon as the first key is found."
+    },
+    "cleanup": {
+      "type": "boolean",
+      "default": true,
+      "description": "Unmount and remove temporary mount points after scanning."
+    },
+    "case_insensitive": {
+      "type": "boolean",
+      "default": true,
+      "description": "Match search_path case-insensitively (FAT/NTFS filesystems are case-insensitive)."
+    },
+    "mount_options": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "default": {},
+      "description": "Extra mount options appended after ro/rw, keyed by filesystem type. Example: { \"vfat\": \"utf8=true\" }."
+    }
+  }
+}
